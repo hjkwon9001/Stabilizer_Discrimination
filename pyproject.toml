@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stabdisc"
+version = "0.3.1"
+description = "Source-only exact stabilizer-discrimination computations"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.scripts]
+stabdisc = "stabdisc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stabdisc*"]
