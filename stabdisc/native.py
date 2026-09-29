@@ -78,9 +78,11 @@ def _configuration(name: str, tstates: int, copies: int) -> _Configuration:
             # and D=(rho0-rho1)/2 have denominator 4 before tensor products.
             return _Configuration(f"twoq_xor_k{copies}", "twoqubit_xor_raw_parallel.cpp",
                                   (("XOR_COPIES", copies),), n, 2 * 4 ** copies * 2 ** n)
-        if name in ("e6_xor", "e8_xor") and copies == 2:
-            source = "e6_sign_xor_t2_raw_parallel.cpp" if name == "e6_xor" else "e8_xor_t2_raw_parallel.cpp"
-            return _Configuration(f"{name}_k2", source, (), 6, 1152 if name == "e6_xor" else 2048)
+        if name == "e8_xor" and 1 <= copies <= 4:
+            return _Configuration(f"e8_xor_k{copies}", "e8_xor_t2_raw_parallel.cpp",
+                                  (("XOR_COPIES", copies),), 3 * copies, 2 ** (5 * copies + 1))
+        if name == "e6_xor" and copies == 2:
+            return _Configuration("e6_xor_k2", "e6_sign_xor_t2_raw_parallel.cpp", (), 6, 1152)
     raise ValueError(f"No native solver for {name!r}, tstates={tstates}, copies={copies}; use the Python solver")
 
 
@@ -282,6 +284,7 @@ def _parse_root_table(text: str, denominator: int, n_qubits: int) -> tuple[Qsqrt
 def run(name: str, *, tstates: int = 0, copies: int = 1, threads: int = 1,
         run_dir: str | Path | None = None, build_dir: str | Path | None = None,
         capacity_power: int | None = None, timeout: float | None = None,
+        node_limit: int | None = None,
         progress: Callable[[ProgressUpdate], None] | None = None) -> NativeResult:
     """Compute a success probability from scratch in a new run directory.
 
@@ -296,6 +299,8 @@ def run(name: str, *, tstates: int = 0, copies: int = 1, threads: int = 1,
     An optional progress callback receives build status and completed first
     measurements read from the solver's freshly written logs. Partial best
     probabilities are lower bounds; the final result is always validated.
+    For E8 XOR, node_limit caps solved states per first-measurement outcome
+    branch. Exceeding this budget aborts without returning an optimum.
     """
     configuration = _configuration(name, tstates, copies)
     if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
@@ -304,6 +309,13 @@ def run(name: str, *, tstates: int = 0, copies: int = 1, threads: int = 1,
         raise ValueError("capacity_power must be an integer in [8,31]")
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("timeout must be finite and positive")
+    if node_limit is not None:
+        if isinstance(node_limit, bool) or not isinstance(node_limit, int) or not 1 <= node_limit < 2 ** 64:
+            raise ValueError("node_limit must be an integer in [1, 2**64-1]")
+        if name != "e8_xor":
+            raise ValueError("node_limit is currently supported only by the E8 XOR native solver")
+    if name == "e8_xor" and capacity_power is not None and capacity_power < 10:
+        raise ValueError("E8 XOR capacity_power must be in [10,31]")
     if configuration.standalone and (capacity_power is not None or threads != 1):
         raise ValueError("E8 sign with two T states does not accept thread or capacity settings")
     if run_dir is None:
@@ -317,13 +329,20 @@ def run(name: str, *, tstates: int = 0, copies: int = 1, threads: int = 1,
     directory.mkdir(parents=True, exist_ok=False)
     command = [str(executable)]
     if not configuration.standalone:
-        power = capacity_power if capacity_power is not None else {2: 8, 3: 10, 4: 13, 5: 19, 6: 25}[configuration.n_qubits]
+        if name == "e8_xor":
+            default_power = {1: 10, 2: 25, 3: 24, 4: 24}[copies]
+        else:
+            default_power = {2: 8, 3: 10, 4: 13, 5: 19, 6: 25}[configuration.n_qubits]
+        power = capacity_power if capacity_power is not None else default_power
         command += ["--threads", str(threads), "--capacity-power", str(power),
                     "--q-start", "1", "--q-end", str(4 ** configuration.n_qubits - 1),
                     "--output", str(directory / "roots.csv"), "--no-resume"]
+        if node_limit is not None:
+            command += ["--node-limit", str(node_limit)]
     metadata = {"name": name, "tstates": tstates, "copies": copies,
                 "status": "running", "command": command, "build": build_metadata,
                 "n_qubits": configuration.n_qubits, "denominator": configuration.denominator,
+                "node_limit": node_limit,
                 "started_utc": datetime.now(timezone.utc).isoformat(),
                 "root_coverage": "standalone_bellman" if configuration.standalone else "all_nonidentity_paulis",
                 "required_root_count": None if configuration.standalone else 4 ** configuration.n_qubits - 1}

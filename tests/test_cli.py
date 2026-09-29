@@ -42,6 +42,24 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result["backend"], "python")
             self.assertTrue(policy.is_file())
 
+    def test_three_and_four_copy_e8_use_native_and_forward_budget(self):
+        for copies in (3, 4):
+            with self.subTest(copies=copies), patch("stabdisc.native.run", side_effect=RuntimeError("budget reached")) as run:
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        run_example("e8_xor", ["--copies", str(copies), "--node-limit", "1000", "--timeout", "10"])
+                self.assertEqual(raised.exception.code, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(run.call_args.args, ("e8_xor",))
+                self.assertEqual(run.call_args.kwargs["copies"], copies)
+                self.assertEqual(run.call_args.kwargs["node_limit"], 1000)
+                self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+    def test_python_rejects_native_branch_budget(self):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_example("e8_xor", ["--copies", "1", "--node-limit", "1000"])
+
     def test_native_failure_does_not_return_a_saved_answer(self):
         with patch("stabdisc.native.run", side_effect=RuntimeError("compiler unavailable")):
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):

@@ -16,6 +16,13 @@ first-measurement lists. This trades speed for a fully enumerated root search.
 The original native source still exposes additional low-level options when
 invoked directly; the Python interface enforces a fresh complete run.
 
+The E8 XOR native solver has been generalized to one through four copies.
+It uses multiword stabilizer keys, factored Pauli coefficients, and the
+Python library's qubit-label ordering. Search limits abort without reporting
+an optimum. Three- and four-copy full searches have not been completed as
+part of validation; small cases, coefficients, key representations, and
+bounded searches are tested independently.
+
 The four-state Clifford+Toffoli script checks a supplied circuit; it does not
 implement a four-T injection protocol.
 
