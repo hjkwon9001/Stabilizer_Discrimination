@@ -7,7 +7,7 @@ from .solver import SolveResult, SolverLimitError, StabilizerDiscriminationSolve
 from .states import (append_t_states, e6_full, e6_sign, e8_full, e8_sign,
                      four_state, tensor_ensembles, twoqubit_mixture, xor_repetition)
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __all__ = [
     "Qsqrt2", "Ensemble", "SolveResult", "SolverLimitError",
     "StabilizerDiscriminationSolver", "success_probability",

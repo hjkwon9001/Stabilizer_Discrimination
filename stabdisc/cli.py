@@ -60,6 +60,8 @@ def _arguments(parser):
                         help="native memo table has 2**P slots per worker")
     parser.add_argument("--timeout", type=float,
                         help="native execution time limit in seconds, excluding compilation")
+    parser.add_argument("--node-limit", type=_positive,
+                        help="E8 XOR native solved-state limit per outcome branch; exceeding it aborts without an optimum")
     parser.add_argument("--no-progress", action="store_true",
                         help="hide the live terminal progress display")
 
@@ -120,7 +122,7 @@ def _evaluate(name, args):
                 "backend selected; use --allow-large only if you intend this expensive calculation"
             )
         if any(option is not None for option in
-               (args.run_dir, args.build_dir, args.capacity_power, args.timeout)) or args.threads != 1:
+               (args.run_dir, args.build_dir, args.capacity_power, args.timeout, args.node_limit)) or args.threads != 1:
             raise ValueError("native run/compile options require --backend native")
     else:
         if not native_available(name, args.tstates, copies):
@@ -153,6 +155,7 @@ def _evaluate(name, args):
             result = run(name, tstates=args.tstates, copies=copies, threads=args.threads,
                          run_dir=args.run_dir, build_dir=args.build_dir,
                          capacity_power=args.capacity_power, timeout=args.timeout,
+                         node_limit=args.node_limit,
                          progress=callback)
             value = result.probability
             record.update(status="computed_native", arithmetic="exact",

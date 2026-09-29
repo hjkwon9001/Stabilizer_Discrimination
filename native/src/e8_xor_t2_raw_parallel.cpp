@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -19,30 +20,36 @@
 #include <utility>
 #include <vector>
 
-// Exact raw Bellman solver for the two-copy E8 XOR/sign-parity task.
-// The two hypotheses are sigma_tau=[I+(-1)^tau W tensor W]/64 on six qubits.
-//
-// The root search is split over the 4095 possible first Pauli measurements.
-// For a fixed first measurement and outcome, every descendant code contains one
-// fixed signed stabilizer, so that branch contains at most the same number of
-// code projectors as a raw five-qubit problem (21,555,667).  Each worker owns a
-// private flat memo table and therefore needs no locks during the recursion.
-//
-// Parallelism is exact but duplicates descendants belonging to different root
-// measurements.  Use the optional Sage root-orbit exporter to reduce the 4095
-// first measurements to one representative per problem-symmetry orbit.
+// Exact raw Bellman solver for k-copy E8 XOR/sign parity.
+// sigma_tau = [I + (-1)^tau W^{tensor k}]/2^(3k), with equal priors.
+// Every nonidentity first Pauli is evaluated for a complete normal run.
+// Each worker owns a memo table, reset between fixed-outcome root branches.
+// This implementation deliberately applies no unverified symmetry reductions.
+
+#ifndef XOR_COPIES
+#define XOR_COPIES 2
+#endif
+static_assert(XOR_COPIES >= 1 && XOR_COPIES <= 4,
+              "E8 XOR supports XOR_COPIES in [1,4]");
 
 namespace {
 
-constexpr int N = 6;
+constexpr int COPIES = XOR_COPIES;
+constexpr int N = 3 * COPIES;
 constexpr int NB = 2 * N;
 constexpr int UMAX = 1 << NB;
 constexpr int SLOTBITS = NB + 1;
-constexpr int COEFF_DEN = 16;
+constexpr int KEY_WORDS = (N * SLOTBITS + 63) / 64;
+constexpr int COEFF_DEN = 1 << (2 * COPIES);
 constexpr int NUM_HYP = 2;
-constexpr int VALUE_DEN = COEFF_DEN * NUM_HYP * (1 << N);  // 2048
-constexpr int DEFAULT_CAPACITY_POWER = 25;                  // 33,554,432 slots
-constexpr uint64_t EXPECTED_BRANCH_PROJECTORS = 21'555'667ULL;
+constexpr int VALUE_DEN = COEFF_DEN * NUM_HYP * (1 << N);
+constexpr int DEFAULT_CAPACITY_POWER = COPIES == 1 ? 12 : (COPIES == 2 ? 25 : 24);
+// At the supported maximum, labels occupy 24 unsigned bits and keys 300 bits.
+// Even the loose bound 2^N*(COEFF_DEN+2^N) < 2^25 on an accumulated
+// numerator fits int32_t. Exact comparisons use int64_t and __int128.
+static_assert(NB < 31);
+static_assert((int64_t{1} << N) * (COEFF_DEN + (int64_t{1} << N)) <
+              (int64_t{1} << 31));
 
 struct Val {
     int32_t a = 0;
@@ -152,84 +159,92 @@ std::vector<int> state_code3(int u, int d, int sign) {
     return code;
 }
 
-std::array<std::array<Val, UMAX>, 2> HYP{};
+// Factored Pauli coefficients avoid a dense 2*4^N hypothesis table.
+std::array<int, 64> ONE_COPY_ETA{};
+std::vector<std::pair<int, int>> ONE_COPY_SUPPORT;
+
+Val hypothesis_coefficient(int hypothesis, int u) {
+    if (u == 0) return {COEFF_DEN, 0};
+    const int mask = (1 << N) - 1;
+    const int x = u & mask;
+    const int z = u >> N;
+    int coefficient = hypothesis == 0 ? 1 : -1;
+    for (int copy = 0; copy < COPIES; ++copy) {
+        const int local = ((x >> (3 * copy)) & 7) |
+                          (((z >> (3 * copy)) & 7) << 3);
+        coefficient *= ONE_COPY_ETA[local];
+        if (coefficient == 0) break;
+    }
+    return {coefficient, 0};
+}
 
 void build_hypotheses() {
-    // First recover the signed Pauli support of the one-copy sign observable W.
-    // For the four E8 plus states, the averaged expectation of a support Pauli
-    // is eta/4, so the corresponding sum over the four pure-state stabilizer
-    // groups is eta in {+1,-1}.
-    std::array<int, 64> eta{};
-    const int us[4] = {0b000, 0b010, 0b001, 0b100};
-    const int ds[4] = {0b111, 0b100, 0b010, 0b001};
-
+    // W=(1/4) sum_p eta_p P_p, obtained from the four E8 plus states.
+    // Its identity coefficient vanishes. For k copies, every tensor-support
+    // coefficient is a product of k signs over 4^k.
+    ONE_COPY_ETA.fill(0);
+    ONE_COPY_SUPPORT.clear();
+    // Match stabdisc.states: the first ket character is qubit zero.
+    // The legacy two-copy program reversed the three local qubits.
+    const int us[4] = {0b000, 0b010, 0b100, 0b001};
+    const int ds[4] = {0b111, 0b001, 0b010, 0b100};
     for (int j = 0; j < 4; ++j) {
-        const auto code = state_code3(us[j], ds[j], 0);  // plus sign
-        for (int p : code) {
+        for (int p : state_code3(us[j], ds[j], 0)) {
             int x, z, sg;
             decp(3, p, x, z, sg);
-            const int u = x | (z << 3);
-            eta[u] += sg ? -1 : 1;
+            ONE_COPY_ETA[x | (z << 3)] += sg ? -1 : 1;
         }
     }
-
-    std::vector<std::pair<int, int>> support;
+    ONE_COPY_ETA[0] = 0;
     for (int u = 1; u < 64; ++u) {
-        if (eta[u] == 0) continue;
-        if (eta[u] != 1 && eta[u] != -1) {
+        const int eta = ONE_COPY_ETA[u];
+        if (eta == 0) continue;
+        if (eta != 1 && eta != -1) {
             throw std::logic_error("Unexpected coefficient in one-copy W support");
         }
-        support.emplace_back(u, eta[u]);
+        ONE_COPY_SUPPORT.emplace_back(u, eta);
     }
-    if (support.size() != 16) {
+    if (ONE_COPY_SUPPORT.size() != 16) {
         throw std::logic_error("One-copy W support must contain 16 Paulis");
     }
+}
 
-    for (auto& row : HYP) {
-        for (auto& value : row) value = {0, 0};
-    }
-
-    // sigma_tau = [I + (-1)^tau W tensor W]/64.
-    // Since W=(1/4) sum_p eta_p P_p, every nonidentity Pauli expectation
-    // in sigma_tau is (-1)^tau eta_p eta_q / 16.  HYP stores Pauli
-    // expectations over the common denominator COEFF_DEN=16.
-    HYP[0][0] = {16, 0};
-    HYP[1][0] = {16, 0};
-
-    int terms = 0;
-    for (const auto& [u1, e1] : support) {
-        const int x1 = u1 & 7;
-        const int z1 = u1 >> 3;
-        for (const auto& [u2, e2] : support) {
-            const int x2 = u2 & 7;
-            const int z2 = u2 >> 3;
-            const int x = x1 | (x2 << 3);
-            const int z = z1 | (z2 << 3);
-            const int u = x | (z << N);
-            const int e = e1 * e2;
-            HYP[0][u] = {e, 0};
-            HYP[1][u] = {-e, 0};
-            ++terms;
+void dump_hypotheses() {
+    build_hypotheses();
+    std::cout << "# COPIES=" << COPIES << " COEFF_DEN=" << COEFF_DEN
+              << " VALUE_DEN=" << VALUE_DEN << '\n';
+    std::cout << "u,a0,b0,a1,b1\n0," << COEFF_DEN << ",0," << COEFF_DEN << ",0\n";
+    std::vector<std::pair<int, int>> tensor{{0, 1}};
+    for (int copy = 0; copy < COPIES; ++copy) {
+        std::vector<std::pair<int, int>> next;
+        next.reserve(tensor.size() * ONE_COPY_SUPPORT.size());
+        for (const auto& [u, e] : tensor) {
+            for (const auto& [local, eta] : ONE_COPY_SUPPORT) {
+                const int shifted = ((local & 7) << (3 * copy)) |
+                                    ((local >> 3) << (N + 3 * copy));
+                next.emplace_back(u | shifted, e * eta);
+            }
         }
+        tensor = std::move(next);
     }
-    if (terms != 256) {
-        throw std::logic_error("W tensor W support must contain 256 Paulis");
-    }
-
-    if (!eqv(HYP[0][0], {16, 0}) || !eqv(HYP[1][0], {16, 0})) {
-        throw std::logic_error("Hypothesis identity expectation is not one");
+    std::sort(tensor.begin(), tensor.end());
+    for (const auto& [u, e] : tensor) {
+        if (!eqv(hypothesis_coefficient(0, u), {e, 0}) ||
+            !eqv(hypothesis_coefficient(1, u), {-e, 0})) {
+            throw std::logic_error("Factored tensor coefficient mismatch");
+        }
+        std::cout << u << ',' << e << ",0," << -e << ",0\n";
     }
 }
+
 struct Key {
-    uint64_t lo = 0;
-    uint64_t hi = 0;  // only the low 14 bits are currently used
+    std::array<uint64_t, KEY_WORDS> words{};
 };
 
-inline bool operator==(const Key& x, const Key& y) {
-    return x.lo == y.lo && x.hi == y.hi;
+inline bool operator==(const Key& x, const Key& y) { return x.words == y.words; }
+inline bool is_zero_key(const Key& x) {
+    return std::all_of(x.words.begin(), x.words.end(), [](uint64_t w) { return w == 0; });
 }
-
-inline bool is_zero_key(const Key& x) { return x.lo == 0 && x.hi == 0; }
 
 uint64_t mix64(uint64_t x) {
     x ^= x >> 33;
@@ -241,16 +256,26 @@ uint64_t mix64(uint64_t x) {
 }
 
 uint64_t hash_key(const Key& key) {
-    return mix64(key.lo ^ std::rotl(key.hi * 0x9e3779b97f4a7c15ULL, 27));
+    uint64_t hash = 0x9e3779b97f4a7c15ULL;
+    for (uint64_t word : key.words) hash = mix64(hash ^ mix64(word));
+    return hash;
 }
 
 Key pack_rows(const std::vector<int>& rows) {
-    unsigned __int128 packed = 0;
+    if (rows.size() > N) throw std::logic_error("Too many stabilizer rows");
+    Key key;
     for (size_t i = 0; i < rows.size(); ++i) {
-        packed |= static_cast<unsigned __int128>(static_cast<uint32_t>(rows[i]))
-                  << (i * SLOTBITS);
+        if (rows[i] <= 0 || rows[i] >= (1 << SLOTBITS)) {
+            throw std::logic_error("Invalid signed stabilizer row");
+        }
+        const size_t bit = i * SLOTBITS;
+        const size_t word = bit / 64;
+        const unsigned offset = bit % 64;
+        const uint64_t value = static_cast<uint32_t>(rows[i]);
+        key.words[word] |= value << offset;
+        if (offset + SLOTBITS > 64) key.words[word + 1] |= value >> (64 - offset);
     }
-    return {static_cast<uint64_t>(packed), static_cast<uint64_t>(packed >> 64)};
+    return key;
 }
 
 int sign_in_code(const std::vector<int>& code, int unsigned_label) {
@@ -294,13 +319,15 @@ Key canonical_key(const std::vector<int>& code) {
 }
 
 std::vector<int> basis_from_key(const Key& key) {
-    const unsigned __int128 packed =
-        static_cast<unsigned __int128>(key.lo) |
-        (static_cast<unsigned __int128>(key.hi) << 64);
-    const unsigned __int128 mask = (static_cast<unsigned __int128>(1) << SLOTBITS) - 1;
+    const uint64_t mask = (uint64_t{1} << SLOTBITS) - 1;
     std::vector<int> basis;
     for (int i = 0; i < N; ++i) {
-        const int p = static_cast<int>((packed >> (i * SLOTBITS)) & mask);
+        const size_t bit = static_cast<size_t>(i) * SLOTBITS;
+        const size_t word = bit / 64;
+        const unsigned offset = bit % 64;
+        uint64_t value = key.words[word] >> offset;
+        if (offset + SLOTBITS > 64) value |= key.words[word + 1] << (64 - offset);
+        const int p = static_cast<int>(value & mask);
         if (p == 0) break;
         basis.push_back(p);
     }
@@ -371,7 +398,7 @@ std::vector<int> nullspace_basis(const std::vector<int>& constraints) {
     return result;
 }
 
-std::vector<int> logical_representatives(const Key& key) {
+std::vector<int> logical_complement(const Key& key) {
     const auto signed_basis = basis_from_key(key);
     std::vector<int> stabilizer_unsigned;
     std::vector<int> constraints;
@@ -399,16 +426,7 @@ std::vector<int> logical_representatives(const Key& key) {
         throw std::logic_error("Logical complement has incorrect dimension");
     }
 
-    std::vector<int> representatives;
-    representatives.reserve((1 << complement.size()) - 1);
-    for (int bits = 1; bits < (1 << static_cast<int>(complement.size())); ++bits) {
-        int q = 0;
-        for (int i = 0; i < static_cast<int>(complement.size()); ++i) {
-            if ((bits >> i) & 1) q ^= complement[i];
-        }
-        representatives.push_back(q);
-    }
-    return representatives;
+    return complement;
 }
 
 uint64_t pack_value(Val value) {
@@ -423,16 +441,19 @@ Val unpack_value(uint64_t packed) {
 
 class FlatMemo {
   public:
+    static size_t checked_capacity(int capacity_power) {
+        if (capacity_power < 10 || capacity_power > 31) {
+            throw std::invalid_argument("capacity power must be in [10,31]");
+        }
+        return size_t{1} << capacity_power;
+    }
+
     explicit FlatMemo(int capacity_power)
-        : capacity_(size_t{1} << capacity_power),
+        : capacity_(checked_capacity(capacity_power)),
           mask_(capacity_ - 1),
           keys_(capacity_),
           values_(capacity_),
-          stamps_(capacity_, 0) {
-        if (capacity_power < 20 || capacity_power > 31) {
-            throw std::invalid_argument("capacity power must be in [20,31]");
-        }
-    }
+          stamps_(capacity_, 0) {}
 
     void begin_epoch() {
         ++epoch_;
@@ -503,11 +524,12 @@ struct BranchStats {
 class BranchSolver {
   public:
     BranchSolver(int capacity_power, uint64_t progress_every, uint64_t node_limit,
-                 int worker_id)
+                 int worker_id, const std::atomic<bool>* cancelled = nullptr)
         : memo_(capacity_power),
           progress_every_(progress_every),
           node_limit_(node_limit),
-          worker_id_(worker_id) {}
+          worker_id_(worker_id),
+          cancelled_(cancelled) {}
 
     Val solve_branch(int q, int outcome_sign, BranchStats& stats) {
         memo_.begin_epoch();
@@ -529,6 +551,16 @@ class BranchSolver {
 
     double memo_gib() const { return memo_.estimated_gib(); }
 
+    // Independent regression tests can solve a small, high-rank code without
+    // launching an exhaustive all-root calculation.
+    Val solve_code_for_test(const std::vector<int>& code) {
+        memo_.begin_epoch();
+        completed_ = 0;
+        by_rank_.fill(0);
+        branch_started_ = std::chrono::steady_clock::now();
+        return solve(canonical_key(code));
+    }
+
   private:
     Val immediate_stop(const std::vector<int>& code, int rank, Val* upper_out) const {
         Val sums[2] = {{0, 0}, {0, 0}};
@@ -536,7 +568,7 @@ class BranchSolver {
             const int u = p & (UMAX - 1);
             const int sign = (p >> NB) & 1;
             for (int s = 0; s < 2; ++s) {
-                Val coefficient = HYP[s][u];
+                Val coefficient = hypothesis_coefficient(s, u);
                 if (sign) coefficient = negv(coefficient);
                 sums[s] = addv(sums[s], coefficient);
             }
@@ -549,6 +581,9 @@ class BranchSolver {
     }
 
     Val solve(const Key& key) {
+        if (cancelled_ && cancelled_->load(std::memory_order_relaxed)) {
+            throw std::runtime_error("Search cancelled after another worker failed");
+        }
         Val cached;
         if (memo_.get(key, cached)) return cached;
 
@@ -562,8 +597,13 @@ class BranchSolver {
         Val best = immediate_stop(code, rank, &upper);
 
         if (rank < N && lessv(best, upper)) {
-            const auto representatives = logical_representatives(key);
-            for (int q : representatives) {
+            // Enumerate nonzero quotient vectors lazily in Gray-code order:
+            // just one XOR per measurement and O(N) scratch per recursion level.
+            const auto complement = logical_complement(key);
+            const int count = 1 << static_cast<int>(complement.size());
+            int q = 0;
+            for (int index = 1; index < count; ++index) {
+                q ^= complement[std::countr_zero(static_cast<unsigned>(index))];
                 const auto plus = extend_code(code, q, 0, N);
                 const auto minus = extend_code(code, q, 1, N);
                 const Val candidate = addv(solve(canonical_key(plus)),
@@ -573,6 +613,9 @@ class BranchSolver {
             }
         }
 
+        if (node_limit_ != 0 && completed_ >= node_limit_) {
+            throw std::runtime_error("Node limit reached (smoke-test termination)");
+        }
         memo_.put(key, best);
         ++completed_;
         ++by_rank_[rank];
@@ -594,6 +637,7 @@ class BranchSolver {
     uint64_t progress_every_;
     uint64_t node_limit_;
     int worker_id_;
+    const std::atomic<bool>* cancelled_;
     uint64_t completed_ = 0;
     std::array<uint64_t, N + 1> by_rank_{};
     std::chrono::steady_clock::time_point branch_started_;
@@ -622,9 +666,10 @@ struct Options {
     uint64_t progress_every = 500'000;
     uint64_t node_limit = 0;
     std::string q_file;
-    std::string output = "e8_xor_t2_root_results.csv";
+    std::string output = "e8_xor_k" + std::to_string(COPIES) + "_root_results.csv";
     bool resume = true;
     bool self_test = false;
+    bool dump_hypotheses = false;
     std::vector<std::string> combine_files;
 };
 
@@ -654,18 +699,58 @@ std::unordered_map<int, RootResult> read_results_file(const std::string& path) {
     std::unordered_map<int, RootResult> results;
     std::ifstream input(path);
     if (!input) return results;
+    if (input.peek() == std::ifstream::traits_type::eof()) return results;
+    bool denominator_ok = false, copies_ok = false, labels_ok = false;
     std::string line;
     while (std::getline(input, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            auto metadata = [&](const std::string& prefix, const std::string& expected,
+                                bool& present) {
+                if (line.rfind(prefix, 0) != 0) return;
+                if (line != expected) {
+                    throw std::runtime_error("Conflicting CSV metadata: " + path);
+                }
+                present = true;
+            };
+            metadata("# VALUE_DEN=", "# VALUE_DEN=" + std::to_string(VALUE_DEN), denominator_ok);
+            metadata("# COPIES=", "# COPIES=" + std::to_string(COPIES), copies_ok);
+            metadata("# LABEL_ORDER=", "# LABEL_ORDER=python_v1", labels_ok);
+            continue;
+        }
         if (line.rfind("q,", 0) == 0) continue;
+        if (!denominator_ok || !copies_ok || !labels_ok) {
+            throw std::runtime_error("Incompatible CSV metadata (copies, denominator or label order): " + path);
+        }
         std::replace(line.begin(), line.end(), ',', ' ');
         std::istringstream parser(line);
         RootResult result;
-        if (parser >> result.q >> result.value.a >> result.value.b >> result.plus.a >>
-                result.plus.b >> result.minus.a >> result.minus.b >> result.nodes_plus >>
-                result.nodes_minus >> result.seconds) {
-            results[result.q] = result;
+        std::string trailing;
+        if (!(parser >> result.q >> result.value.a >> result.value.b >> result.plus.a >>
+              result.plus.b >> result.minus.a >> result.minus.b >> result.nodes_plus >>
+              result.nodes_minus >> result.seconds) || (parser >> trailing)) {
+            throw std::runtime_error("Malformed result row: " + path);
         }
+        // This family is rational. Validate the completed-root records before
+        // allowing either resume or --combine to certify a full calculation.
+        if (result.q <= 0 || result.q >= UMAX || result.value.b != 0 ||
+            result.plus.b != 0 || result.minus.b != 0 ||
+            result.plus.a < 0 || result.plus.a > VALUE_DEN / 2 ||
+            result.minus.a < 0 || result.minus.a > VALUE_DEN / 2 ||
+            result.value.a < VALUE_DEN / 2 || result.value.a > VALUE_DEN ||
+            !eqv(result.value, addv(result.plus, result.minus)) ||
+            !std::isfinite(result.seconds) || result.seconds < 0) {
+            throw std::runtime_error("Invalid completed-root result: " + path);
+        }
+        const auto [it, inserted] = results.emplace(result.q, result);
+        if (!inserted && (!eqv(it->second.value, result.value) ||
+                          !eqv(it->second.plus, result.plus) ||
+                          !eqv(it->second.minus, result.minus))) {
+            throw std::runtime_error("Conflicting duplicate root result: " + path);
+        }
+    }
+    if (!denominator_ok || !copies_ok || !labels_ok) {
+        throw std::runtime_error("Incompatible CSV metadata (copies, denominator or label order): " + path);
     }
     return results;
 }
@@ -676,36 +761,28 @@ void append_result(std::ofstream& output, const RootResult& result) {
            << result.minus.b << ',' << result.nodes_plus << ',' << result.nodes_minus
            << ',' << std::setprecision(17) << result.seconds << '\n';
     output.flush();
+    if (!output) throw std::runtime_error("Could not write completed-root result");
 }
 
 void print_summary(const std::unordered_map<int, RootResult>& results,
-                   size_t required_count, bool representatives_assumed) {
-    Val best = {VALUE_DEN / 2, 0};  // Stop immediately and guess the sign.
+                   size_t required_count, bool /*representatives_assumed*/) {
+    Val best = {VALUE_DEN / 2, 0};
     int best_q = 0;
     for (const auto& [q, result] : results) {
-        if (lessv(best, result.value)) {
-            best = result.value;
-            best_q = q;
-        }
+        if (lessv(best, result.value)) { best = result.value; best_q = q; }
     }
-
-    std::cout << "\n=== root summary ===\n";
-    std::cout << "completed first measurements = " << results.size() << " / "
-              << required_count << "\n";
-    std::cout << "best q = " << best_q << "\n";
-    std::cout << "best value = " << val_string(best) << " = " << decv(best)
-              << "\n";
-    if (results.size() == required_count) {
-        if (representatives_assumed) {
-            std::cout << "RESULT_NUM " << best.a << ' ' << best.b << " DEN "
-                      << VALUE_DEN << "\n";
-            std::cout << "Result is exact provided the q-file contains one representative "
-                         "from every root-measurement orbit.\n";
-        } else {
-            std::cout << "RESULT_NUM " << best.a << ' ' << best.b << " DEN "
-                      << VALUE_DEN << "\n";
-            std::cout << "Exact raw root search complete.\n";
-        }
+    std::cout << "\n=== root summary ===\n"
+              << "completed first measurements = " << results.size() << " / "
+              << required_count << "\n"
+              << "best q = " << best_q << "\n"
+              << "best value = " << val_string(best) << " = " << decv(best) << "\n";
+    // A completed subset is only a lower bound. No user-provided orbit claim
+    // or selected range may produce the verified-completion sentinel.
+    bool full = results.size() == static_cast<size_t>(UMAX - 1);
+    for (int q = 1; full && q < UMAX; ++q) full = results.contains(q);
+    if (full) {
+        std::cout << "RESULT_NUM " << best.a << ' ' << best.b << " DEN "
+                  << VALUE_DEN << "\nExact raw root search complete.\n";
     } else {
         std::cout << "Partial run: this is only a certified lower bound.\n";
     }
@@ -714,37 +791,78 @@ void print_summary(const std::unordered_map<int, RootResult>& results,
 void combine_files(const Options& options) {
     std::unordered_map<int, RootResult> all;
     for (const auto& path : options.combine_files) {
+        if (!std::ifstream(path)) throw std::runtime_error("Could not open combined CSV: " + path);
         auto part = read_results_file(path);
-        all.insert(part.begin(), part.end());
+        for (const auto& [q, result] : part) {
+            const auto [it, inserted] = all.emplace(q, result);
+            if (!inserted && (!eqv(it->second.value, result.value) ||
+                              !eqv(it->second.plus, result.plus) ||
+                              !eqv(it->second.minus, result.minus))) {
+                throw std::runtime_error("Conflicting duplicate root across CSV files");
+            }
+        }
     }
     print_summary(all, UMAX - 1, false);
 }
 
 void self_test() {
     build_hypotheses();
-    if (!eqv(HYP[0][0], {16, 0}) || !eqv(HYP[1][0], {16, 0})) {
+    if (!eqv(hypothesis_coefficient(0, 0), {COEFF_DEN, 0}) ||
+        !eqv(hypothesis_coefficient(1, 0), {COEFF_DEN, 0})) {
         throw std::logic_error("Identity coefficient test failed");
     }
-
     std::vector<int> root{0};
-    const Key root_key = canonical_key(root);
-    if (!is_zero_key(root_key)) throw std::logic_error("Root key is not zero");
-
-    const auto child_plus = extend_code(root, 1, 0, N);
-    const auto child_minus = extend_code(root, 1, 1, N);
-    if (canonical_key(child_plus) == canonical_key(child_minus)) {
+    if (!is_zero_key(canonical_key(root))) throw std::logic_error("Root key is not zero");
+    if (canonical_key(extend_code(root, 1, 0, N)) ==
+        canonical_key(extend_code(root, 1, 1, N))) {
         throw std::logic_error("Opposite measurement outcomes have identical keys");
     }
-
-    BranchSolver smoke(20, 1000, 5000, 0);
-    BranchStats stats;
-    try {
-        (void)smoke.solve_branch(1, 0, stats);
-    } catch (const std::runtime_error& error) {
-        const std::string message = error.what();
-        if (message.find("Node limit reached") == std::string::npos) throw;
+    // Fill every row, including row fields crossing 64/128/192/256-bit word
+    // boundaries. Every one-bit change must survive packing and unpacking.
+    std::vector<int> rows;
+    for (int i = 0; i < N; ++i) rows.push_back((1 << i) | (1 << NB));
+    const Key packed = pack_rows(rows);
+    if (basis_from_key(packed) != rows) throw std::logic_error("Wide key roundtrip failed");
+    for (int row = 0; row < N; ++row) {
+        for (int bit = 0; bit < SLOTBITS; ++bit) {
+            auto changed = rows;
+            changed[row] ^= 1 << bit;
+            const Key other = pack_rows(changed);
+            if (other == packed || basis_from_key(other) != changed) {
+                throw std::logic_error("Wide key bit collision");
+            }
+        }
     }
-    std::cout << "self-test passed; smoke recursion reached the requested node limit\n";
+    const auto code = code_from_key(packed);
+    if (code_from_key(canonical_key(code)) != code) {
+        throw std::logic_error("Stabilizer-code canonical roundtrip failed");
+    }
+    BranchSolver smoke(12, 0, 1000, 0);
+    BranchStats stats;
+    try { (void)smoke.solve_branch(1, 0, stats); }
+    catch (const std::runtime_error& error) {
+        if (std::string(error.what()).find("Node limit reached") == std::string::npos) throw;
+    }
+    std::cout << "self-test passed; copies=" << COPIES << " qubits=" << N
+              << " key_words=" << KEY_WORDS << " denominator=" << VALUE_DEN
+              << "; bounded recursion checked\n";
+}
+
+int integer_option(const std::string& text) {
+    size_t consumed = 0;
+    const int value = std::stoi(text, &consumed);
+    if (consumed != text.size()) throw std::invalid_argument("Invalid integer option: " + text);
+    return value;
+}
+
+uint64_t count_option(const std::string& text) {
+    if (text.empty() || text.front() == '-') {
+        throw std::invalid_argument("Count options must be nonnegative");
+    }
+    size_t consumed = 0;
+    const uint64_t value = std::stoull(text, &consumed);
+    if (consumed != text.size()) throw std::invalid_argument("Invalid count option: " + text);
+    return value;
 }
 
 Options parse_options(int argc, char** argv) {
@@ -757,25 +875,27 @@ Options parse_options(int argc, char** argv) {
         };
 
         if (arg == "--threads") {
-            options.threads = std::stoi(require_value("--threads"));
+            options.threads = integer_option(require_value("--threads"));
         } else if (arg == "--q-start") {
-            options.q_start = std::stoi(require_value("--q-start"));
+            options.q_start = integer_option(require_value("--q-start"));
         } else if (arg == "--q-end") {
-            options.q_end = std::stoi(require_value("--q-end"));
+            options.q_end = integer_option(require_value("--q-end"));
         } else if (arg == "--q-file") {
             options.q_file = require_value("--q-file");
         } else if (arg == "--output") {
             options.output = require_value("--output");
         } else if (arg == "--capacity-power") {
-            options.capacity_power = std::stoi(require_value("--capacity-power"));
+            options.capacity_power = integer_option(require_value("--capacity-power"));
         } else if (arg == "--progress-every") {
-            options.progress_every = std::stoull(require_value("--progress-every"));
+            options.progress_every = count_option(require_value("--progress-every"));
         } else if (arg == "--node-limit") {
-            options.node_limit = std::stoull(require_value("--node-limit"));
+            options.node_limit = count_option(require_value("--node-limit"));
         } else if (arg == "--no-resume") {
             options.resume = false;
         } else if (arg == "--self-test") {
             options.self_test = true;
+        } else if (arg == "--dump-hypotheses") {
+            options.dump_hypotheses = true;
         } else if (arg == "--combine") {
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 options.combine_files.push_back(argv[++i]);
@@ -785,17 +905,19 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--help" || arg == "-h") {
             std::cout
-                << "Usage: e8_xor_t2_raw_parallel [options]\n\n"
+                << "Usage: e8_xor_k" << COPIES << " [options]\n\n"
                 << "  --threads N             Parallel root jobs (default 1)\n"
                 << "  --q-start A             First unsigned Pauli label (default 1)\n"
-                << "  --q-end B               Last unsigned Pauli label (default 4095)\n"
-                << "  --q-file FILE           Use listed root-measurement representatives\n"
+                << "  --q-end B               Last unsigned Pauli label (default " << UMAX - 1 << ")\n"
+                << "  --q-file FILE           Use listed roots (a subset gives a lower bound)\n"
                 << "  --output FILE           Append/resume CSV results\n"
-                << "  --capacity-power P      Per-worker flat table has 2^P slots (default 25)\n"
+                << "  --capacity-power P      Per-worker table 2^P slots, P=10..31 (default "
+                << DEFAULT_CAPACITY_POWER << ")\n"
                 << "  --progress-every N      Branch-node progress cadence\n"
                 << "  --node-limit N          Smoke test: stop each branch after N solved nodes\n"
                 << "  --no-resume             Ignore existing output CSV\n"
                 << "  --self-test             Run algebra/key/smoke checks\n"
+                << "  --dump-hypotheses       Print exact tensor-support coefficients\n"
                 << "  --combine FILE...       Combine raw range-result CSV files\n";
             std::exit(0);
         } else {
@@ -804,6 +926,7 @@ Options parse_options(int argc, char** argv) {
     }
 
     if (options.threads <= 0) throw std::invalid_argument("threads must be positive");
+    (void)FlatMemo::checked_capacity(options.capacity_power);
     if (options.q_start < 1 || options.q_end >= UMAX || options.q_start > options.q_end) {
         throw std::invalid_argument("Invalid q range");
     }
@@ -823,6 +946,10 @@ int main(int argc, char** argv) {
             self_test();
             return 0;
         }
+        if (options.dump_hypotheses) {
+            dump_hypotheses();
+            return 0;
+        }
 
         build_hypotheses();
 
@@ -832,6 +959,8 @@ int main(int argc, char** argv) {
         } else {
             for (int q = options.q_start; q <= options.q_end; ++q) q_values.push_back(q);
         }
+
+        if (q_values.empty()) throw std::invalid_argument("No root measurements selected");
 
         auto existing = options.resume ? read_results_file(options.output)
                                        : std::unordered_map<int, RootResult>{};
@@ -845,9 +974,9 @@ int main(int argc, char** argv) {
             (sizeof(Key) + sizeof(uint64_t) + sizeof(uint32_t));
         const double gib_per_worker = static_cast<double>(
             memo_bytes / (1024.0L * 1024.0L * 1024.0L));
-        std::cout << "problem = two-copy E8 XOR/sign parity\n"
+        std::cout << "problem = " << COPIES << "-copy E8 XOR/sign parity\n"
+                  << "qubits = " << N << "\n"
                   << "value denominator = " << VALUE_DEN << "\n"
-                  << "conjectured target = 1280/2048 = 5/8\n"
                   << "requested root measurements = " << q_values.size() << "\n"
                   << "already completed = " << (q_values.size() - pending.size()) << "\n"
                   << "pending = " << pending.size() << "\n"
@@ -856,9 +985,7 @@ int main(int argc, char** argv) {
                   << "estimated memo memory per worker = " << std::fixed
                   << std::setprecision(2) << gib_per_worker << " GiB\n"
                   << "estimated total memo memory = " << gib_per_worker * options.threads
-                  << " GiB\n"
-                  << "one fixed-outcome branch has at most approximately "
-                  << EXPECTED_BRANCH_PROJECTORS << " code projectors\n";
+                  << " GiB\n" << std::defaultfloat << std::setprecision(17) << std::flush;
 
         if (pending.empty()) {
             std::unordered_map<int, RootResult> selected_results;
@@ -872,27 +999,36 @@ int main(int argc, char** argv) {
 
         std::ofstream output;
         {
-            const bool file_exists = static_cast<bool>(std::ifstream(options.output));
+            std::ifstream previous_output(options.output);
+            const bool file_exists = previous_output &&
+                previous_output.peek() != std::ifstream::traits_type::eof();
+            previous_output.close();
             const auto mode = options.resume ? std::ios::app : std::ios::trunc;
             output.open(options.output, mode);
             if (!output) throw std::runtime_error("Could not open output file");
             if (!file_exists || !options.resume) {
-                output << "# stabdisc two-copy E8 XOR, raw root split\n"
+                output << "# stabdisc E8 XOR, raw root split\n"
+                       << "# COPIES=" << COPIES << "\n"
+                       << "# LABEL_ORDER=python_v1\n"
                        << "# VALUE_DEN=" << VALUE_DEN << "\n"
                        << "q,a,b,plus_a,plus_b,minus_a,minus_b,nodes_plus,nodes_minus,seconds\n";
                 output.flush();
+                if (!output) throw std::runtime_error("Could not write result CSV header");
             }
         }
 
         std::mutex result_mutex;
         std::atomic<size_t> next_index{0};
         std::atomic<size_t> finished{0};
+        std::atomic<bool> cancelled{false};
+        std::exception_ptr worker_error;
         const auto all_started = std::chrono::steady_clock::now();
 
         auto worker = [&](int worker_id) {
+          try {
             BranchSolver solver(options.capacity_power, options.progress_every,
-                                options.node_limit, worker_id);
-            while (true) {
+                                options.node_limit, worker_id, &cancelled);
+            while (!cancelled.load(std::memory_order_relaxed)) {
                 const size_t index = next_index.fetch_add(1);
                 if (index >= pending.size()) break;
                 const int q = pending[index];
@@ -923,15 +1059,28 @@ int main(int argc, char** argv) {
                               << " dec=" << decv(result.value)
                               << " nodes=(" << result.nodes_plus << ','
                               << result.nodes_minus << ") seconds=" << result.seconds
-                              << " total_elapsed=" << total_seconds << "s\n";
+                              << " total_elapsed=" << total_seconds << "s\n" << std::flush;
                 }
             }
+          } catch (...) {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            if (!worker_error) worker_error = std::current_exception();
+            cancelled.store(true, std::memory_order_relaxed);
+          }
         };
 
         std::vector<std::thread> threads;
         threads.reserve(options.threads);
-        for (int t = 0; t < options.threads; ++t) threads.emplace_back(worker, t);
+        try {
+            const size_t worker_count = std::min(static_cast<size_t>(options.threads), pending.size());
+            for (size_t t = 0; t < worker_count; ++t) threads.emplace_back(worker, static_cast<int>(t));
+        } catch (...) {
+            cancelled.store(true, std::memory_order_relaxed);
+            for (auto& thread : threads) thread.join();
+            throw;
+        }
         for (auto& thread : threads) thread.join();
+        if (worker_error) std::rethrow_exception(worker_error);
 
         std::unordered_map<int, RootResult> selected_results;
         for (int q : q_values) {

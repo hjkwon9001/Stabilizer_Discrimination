@@ -7,10 +7,9 @@ run outputs**. Every example computes its result.
 
 ## Start here
 
-Open Terminal and enter:
+Open Terminal in your cloned `Stabilizer_Discrimination` project folder and enter:
 
 ```bash
-cd ~/Desktop/Stabilizer_Success_Source
 python3 run.py e8_sign
 ```
 
@@ -62,7 +61,6 @@ To watch a native calculation from a second Terminal window, including a
 calculation started before this update:
 
 ```bash
-cd ~/Desktop/Stabilizer_Success_Source
 python3 monitor.py --latest
 ```
 
@@ -125,6 +123,56 @@ This project recomputes the full search; it does not read a saved answer or
 saved list of symmetry representatives. To check the setup quickly, use
 `--copies 1`.
 
+### E8 XOR with three or four copies
+
+E8 XOR now has a C++ implementation for **one through four copies**. Three
+copies use nine qubits; four copies use twelve. The default backend selects
+C++ for two or more copies. For a short setup test, run:
+
+```bash
+python3 run.py e8_xor --copies 3 --capacity-power 16 --node-limit 1000 --timeout 30
+```
+
+This compiles the solver and starts a fresh search with a limit of 1,000
+solved states per first-measurement outcome branch. Reaching a state limit,
+time limit, or memo-table capacity stops the run with a nonzero exit status;
+it **does not produce an optimal success probability**. Logs and the failed
+run status remain in the new `runs/` subfolder. `--timeout` excludes compilation.
+
+To start a search without the test budget:
+
+```bash
+python3 run.py e8_xor --copies 3 --threads 1 --output outputs/e8-xor-3.json
+```
+
+Use `--copies 4` for four copies. These are exhaustive searches over 262,143
+and 16,777,215 first measurements, respectively. Support for these sizes is
+not a promise of practical completion time or sufficient memory: the memo
+table can fill before even one first measurement finishes. There is no
+validated runtime estimate for either full calculation.
+
+Three- and four-copy runs default to `--capacity-power 24`. The memo table
+alone uses approximately 0.56 GiB per worker for three copies and 0.81 GiB
+for four copies. Increasing the power by one doubles that allocation;
+`--threads` multiplies it. The table stops at 80% occupancy rather than
+discarding cached values or silently approximating the result. Choose a
+smaller capacity and a timeout for initial experiments.
+Root bookkeeping, logs, monitoring, and final CSV validation use additional
+memory. For a completed four-copy search these can require several more
+gigabytes beyond the worker memo tables.
+
+For a quick complete native regression, use one copy explicitly:
+
+```bash
+python3 run.py e8_xor --copies 1 --backend native
+```
+
+The generalized E8 solver uses the same qubit-label ordering as the Python
+library. Older native E8 XOR root labels reverse the three qubits within
+each copy; this relabeling leaves the optimal probability unchanged. Old
+root CSVs cannot be resumed by the generalized solver. The Python runner
+always starts a fresh run.
+
 ## All examples
 
 | Script | Calculation | Parameters |
@@ -169,7 +217,7 @@ Bellman recursion. The native implementations are specialized:
 | Native calculation | Supported parameters |
 |---|---|
 | E8 sign | 2 or 3 T states |
-| E8 XOR | 2 copies |
+| E8 XOR | 1–4 copies |
 | E6 sign | 0–3 T states |
 | E6 full labels | 3 T states |
 | E6 XOR | 2 copies |
@@ -288,7 +336,7 @@ STABDISC_TEST_NATIVE=1 python3 -m unittest discover -s tests -v
 ## Folder layout
 
 ```text
-Stabilizer_Success_Source/
+Stabilizer_Discrimination/
   run.py             simple entry point
   monitor.py         read-only viewer for a native run
   stabdisc/          computation library

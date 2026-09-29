@@ -29,8 +29,9 @@ class NativeValidationTests(unittest.TestCase):
         cases += [("twoqubit_tstates", m, 1) for m in range(5)]
         cases += [("four_state_tstates", m, 1) for m in range(4)]
         cases += [("twoqubit_xor", 0, k) for k in (2, 3)]
-        cases += [("e6_full", 3, 1), ("e6_xor", 0, 2), ("e8_xor", 0, 2)]
-        self.assertEqual(len(cases), 20)
+        cases += [("e6_full", 3, 1), ("e6_xor", 0, 2)]
+        cases += [("e8_xor", 0, k) for k in range(1, 5)]
+        self.assertEqual(len(cases), 23)
         for name, tstates, copies in cases:
             with self.subTest(name=name, tstates=tstates, copies=copies):
                 self.assertTrue(native.native_available(name, tstates, copies))
@@ -39,7 +40,7 @@ class NativeValidationTests(unittest.TestCase):
         for name, tstates, copies in (("e8_full", 0, 1), ("e8_sign", 1, 1),
                                      ("e6_full", 0, 1), ("twoqubit_xor", 0, 1),
                                      ("e6_sign", 4, 1), ("e8_xor", 1, 2),
-                                     ("twoqubit_tstates", 0, 2), ("unknown", 0, 1)):
+                                     ("e8_xor", 0, 5), ("twoqubit_tstates", 0, 2), ("unknown", 0, 1)):
             self.assertFalse(native.native_available(name, tstates, copies))
 
     def test_strict_summary_parser(self):
@@ -83,6 +84,36 @@ class NativeValidationTests(unittest.TestCase):
                      {"tstates": True}, {"copies": 0}):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 native.run("twoqubit_tstates", **args)
+
+    def test_e8_limits_rejected_before_build(self):
+        with patch.object(native, "_checked_build") as build:
+            for options in ({"node_limit": 0}, {"node_limit": True}, {"node_limit": 1.5},
+                            {"node_limit": 2 ** 64}, {"capacity_power": 9}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    native.run("e8_xor", copies=3, **options)
+            with self.assertRaisesRegex(ValueError, "only.*E8 XOR"):
+                native.run("twoqubit_xor", copies=2, node_limit=100)
+            build.assert_not_called()
+
+    def test_three_copy_e8_budget_failure_is_not_an_optimum(self):
+        def fake_run(command, **kwargs):
+            self.assertEqual(command[command.index("--q-end") + 1], "262143")
+            self.assertEqual(command[command.index("--capacity-power") + 1], "24")
+            self.assertEqual(command[command.index("--node-limit") + 1], "1000")
+            kwargs["stderr"].write("Node limit reached\n")
+            return subprocess.CompletedProcess(command, 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "run"
+            with patch.object(native, "_checked_build", return_value=(Path("/fake/solver"), {})), \
+                 patch.object(native.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(RuntimeError):
+                    native.run("e8_xor", copies=3, node_limit=1000, run_dir=directory)
+            metadata = json.loads((directory / "run.json").read_text())
+            self.assertEqual(metadata["status"], "failed")
+            self.assertEqual(metadata["n_qubits"], 9)
+            self.assertEqual(metadata["denominator"], 65536)
+            self.assertNotIn("probability_a", metadata)
 
     def test_partial_table_rejected_despite_success_sentinel(self):
         table = "\n".join(root_table().splitlines()[:-1]) + "\n"
